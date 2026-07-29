@@ -42,12 +42,20 @@ def test_get_devops_controlled_repositories():
                 "onscale-terraform-vpc",
             ],
         ):
-            repositories = (
-                stale_prs
-                .get_devops_controlled_repositories()
-            )
+            with patch(
+                "src.tf_module_upgrade."
+                "stale_prs.hcl.get_sre_applications",
+                return_value=[
+                    "onscale-sre-application-blueprint",
+                ],
+            ):
+                repositories = (
+                    stale_prs
+                    .get_devops_controlled_repositories()
+                )
 
     assert repositories == [
+        "onscale-sre-application-blueprint",
         "onscale-terraform-account",
         "onscale-terraform-awsansys1",
         "onscale-terraform-vpc",
