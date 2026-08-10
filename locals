@@ -46,6 +46,41 @@ locals {
     }
   })
 
+  elastic_agent_otel_env = {
+    name  = "ELASTIC_AGENT_OTEL"
+    value = "\"true\""
+  }
+
+  # env is a list, so Helm replaces it wholesale and these must restate every entry
+  # Elastic had. Covered by the fingerprint guard in fetch-values.sh.
+  env_overlay = yamlencode({
+    collectors = {
+      cluster = { env = [local.elastic_agent_otel_env] }
+      daemon  = { env = [local.elastic_agent_otel_env] }
+      gateway = {
+        env = [
+          local.elastic_agent_otel_env,
+          {
+            name      = "ELASTIC_ENDPOINT"
+            valueFrom = { secretKeyRef = { name = local.secret_name, key = "elastic_endpoint" } }
+          },
+          {
+            name      = "ELASTIC_API_KEY"
+            valueFrom = { secretKeyRef = { name = local.secret_name, key = "elastic_api_key" } }
+          },
+          {
+            name      = "GOMAXPROCS"
+            valueFrom = { resourceFieldRef = { resource = "limits.cpu" } }
+          },
+          {
+            name  = "GOMEMLIMIT"
+            value = "1025MiB"
+          },
+        ]
+      }
+    }
+  })
+
   gateway_pipeline_processors = {
     metrics                           = ["resource/data_stream_namespace", "batch/metrics"]
     logs                              = ["resource/data_stream_namespace", "batch"]
