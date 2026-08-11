@@ -46,6 +46,24 @@ locals {
     }
   })
 
+  otlp_port_overlay = yamlencode({
+    collectors = {
+      daemon = {
+        config = {
+          receivers = {
+            otlp = {
+              protocols = {
+                http = {
+                  endpoint = "0.0.0.0:${var.otlp_http_port}"
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  })
+
   elastic_agent_otel_env = {
     name  = "ELASTIC_AGENT_OTEL"
     value = "\"true\""
@@ -124,6 +142,3 @@ locals {
     local.cluster_name_overlay,
   )
 }
-kubectl -n opentelemetry-operator-system get pod \
-  <PENDING-DAEMON-POD> \
-  -o jsonpath='{range .spec.containers[*]}{"CONTAINER: "}{.name}{"\n"}{range .ports[*]}{"  name="}{.name}{" containerPort="}{.containerPort}{" hostPort="}{.hostPort}{" protocol="}{.protocol}{"\n"}{end}{end}'
