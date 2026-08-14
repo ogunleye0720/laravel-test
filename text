@@ -1,0 +1,86 @@
+variable "name" {
+  description = "Base name for resources, typically the cluster identifier."
+  type        = string
+}
+
+variable "vpc_id" {
+  type = string
+}
+
+variable "private_subnet_ids" {
+  description = <<-EOT
+    Private subnets the Lambda runs in.
+
+    These should be the same subnets the cluster security group allows, so the
+    function needs no ingress rule of its own.
+  EOT
+  type        = list(string)
+}
+
+variable "kms_key_arn" {
+  description = "CMK protecting the master secret, for kms:Decrypt."
+  type        = string
+}
+
+variable "db_host" {
+  description = "Cluster writer endpoint. The Lambda connects here directly."
+  type        = string
+}
+
+variable "db_port" {
+  type    = number
+  default = 5432
+}
+
+variable "db_name" {
+  type = string
+}
+
+variable "master_secret_arn" {
+  description = <<-EOT
+    Secrets Manager ARN of the RDS-managed master credential.
+
+    Only the ARN is passed - Terraform never reads the secret. The Lambda
+    resolves it at runtime, inside the VPC, so it never lands in state.
+  EOT
+  type        = string
+}
+
+variable "db_users" {
+  description = <<-EOT
+    Passwordless roles to create, each granted rds_iam.
+
+    Removing an entry DROPS the role, diffed against the previous apply via
+    tf.prev_input. Without that, a removed user would linger with rds_iam
+    intact and stay reachable by any IAM role still holding rds-db:connect
+    for that username.
+  EOT
+  type = list(object({
+    username   = string
+    privileges = optional(string, "readwrite")
+    schema     = optional(string, "public")
+  }))
+  default = []
+}
+
+variable "layer_arns" {
+  description = "Lambda layers providing psycopg2 for python3.12."
+  type        = list(string)
+  default     = []
+}
+
+variable "log_retention_days" {
+  type    = number
+  default = 30
+}
+
+variable "alarm_actions" {
+  description = "SNS topics notified if the bootstrap fails."
+  type        = list(string)
+  default     = []
+}
+
+variable "tags" {
+  type    = map(string)
+  default = {}
+}
