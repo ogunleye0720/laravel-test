@@ -1,28 +1,3 @@
-"""
-Creates passwordless IAM-authenticated database roles in Aurora PostgreSQL.
-
-Invoked by Terraform (aws_lambda_invocation, lifecycle_scope = "CRUD").
-Resolves the RDS-managed master secret at runtime so that no credential is
-ever written to Terraform state.
-
-Every role created here has NO PASSWORD. Authentication happens via
-`GRANT rds_iam`, which makes PostgreSQL accept the SigV4 token that RDS
-validates on the client's behalf.
-
-Event shape (Terraform supplies the `tf` object under lifecycle_scope=CRUD):
-
-    {
-      "users": [ {"username": ..., "privileges": ..., "schema": ...}, ... ],
-      "tf": {
-        "action": "create" | "update" | "delete",
-        "prev_input": { "users": [...] }        # update and delete only
-      }
-    }
-
-Idempotent: safe to invoke repeatedly with the same input. The whole run is
-one transaction, so a failure part-way leaves the database untouched.
-"""
-
 import json
 import logging
 import os
@@ -34,10 +9,9 @@ from psycopg2 import sql
 logging.getLogger().setLevel(logging.INFO)
 log = logging.getLogger(__name__)
 
-# Kept in step with the `privileges` validation in modules/aurora-iam/variables.tf.
-# Terraform rejects a bad value at plan time; this is the backstop for a direct
-# invocation that bypasses Terraform.
 VALID_PRIVILEGES = {"read", "readwrite", "migrate", "app_admin"}
+
+VALID_ACTIONS = {"create", "update", "delete"}
 
 
 def _master_credentials():
@@ -60,13 +34,18 @@ def _connect():
     )
 
 
-def _require_schema(cur, schema: str) -> None:
-    """Fail with a readable message rather than a bare psycopg2 error."""
+def _schema_exists(cur, schema: str) -> bool:
+    """Return True when the schema exists in the current database."""
     cur.execute(
         "SELECT 1 FROM information_schema.schemata WHERE schema_name = %s",
         (schema,),
     )
-    if cur.fetchone() is None:
+    return cur.fetchone() is not None
+
+
+def _require_schema(cur, schema: str) -> None:
+    """Fail with a readable message rather than a bare psycopg2 error."""
+    if not _schema_exists(cur, schema):
         raise ValueError(
             f"schema '{schema}' does not exist in database "
             f"'{os.environ['DB_NAME']}'. Create it in a migration before "
@@ -83,11 +62,60 @@ def _ensure_role(cur, username: str) -> None:
     else:
         log.info("role %s already exists", username)
 
-    # Defensive: strip any password that may have been set out of band.
     cur.execute(
         sql.SQL("ALTER ROLE {} WITH PASSWORD NULL").format(sql.Identifier(username))
     )
+    
     cur.execute(sql.SQL("GRANT rds_iam TO {}").format(sql.Identifier(username)))
+
+
+def _has_effective_role_membership(cur, username: str, role_name: str) -> bool:
+    cur.execute("SELECT pg_has_role(%s, %s, 'MEMBER')", (username, role_name))
+    return bool(cur.fetchone()[0])
+
+
+def _revoke_global_managed_privileges(cur, username: str) -> None:
+    ident = sql.Identifier(username)
+    database = sql.Identifier(os.environ["DB_NAME"])
+    
+    if _has_effective_role_membership(cur, username, "rds_superuser"):
+        log.info("revoking rds_superuser from role %s", username)
+        cur.execute(sql.SQL("REVOKE rds_superuser FROM {}").format(ident))
+
+    cur.execute(
+        sql.SQL("REVOKE CONNECT, CREATE, TEMPORARY ON DATABASE {} FROM {}").format(
+            database, ident
+        )
+    )
+
+
+def _revoke_schema_managed_privileges(cur, username: str, schema: str) -> None:
+    ident = sql.Identifier(username)
+    sch = sql.Identifier(schema)
+
+    log.info("resetting managed privileges for role=%s schema=%s", username, schema)
+
+    cur.execute(sql.SQL("REVOKE USAGE, CREATE ON SCHEMA {} FROM {}").format(sch, ident))
+    cur.execute(
+        sql.SQL(
+            "REVOKE SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA {} FROM {}"
+        ).format(sch, ident)
+    )
+    cur.execute(
+        sql.SQL("REVOKE USAGE ON ALL SEQUENCES IN SCHEMA {} FROM {}").format(sch, ident)
+    )
+
+    cur.execute(
+        sql.SQL(
+            "ALTER DEFAULT PRIVILEGES IN SCHEMA {} "
+            "REVOKE SELECT, INSERT, UPDATE, DELETE ON TABLES FROM {}"
+        ).format(sch, ident)
+    )
+    cur.execute(
+        sql.SQL(
+            "ALTER DEFAULT PRIVILEGES IN SCHEMA {} REVOKE USAGE ON SEQUENCES FROM {}"
+        ).format(sch, ident)
+    )
 
 
 def _grant_read(cur, ident, sch) -> None:
@@ -108,9 +136,7 @@ def _grant_readwrite(cur, ident, sch) -> None:
     cur.execute(
         sql.SQL("GRANT USAGE ON ALL SEQUENCES IN SCHEMA {} TO {}").format(sch, ident)
     )
-    # Default privileges cover tables created LATER, but only those created by
-    # the role running this statement (the master user). Objects created by a
-    # migration running as someone else are not covered.
+
     cur.execute(
         sql.SQL(
             "ALTER DEFAULT PRIVILEGES IN SCHEMA {} "
@@ -127,47 +153,78 @@ def _grant_readwrite(cur, ident, sch) -> None:
 def _apply_privileges(cur, username: str, privileges: str, schema: str) -> None:
     ident = sql.Identifier(username)
     sch = sql.Identifier(schema)
+    database = sql.Identifier(os.environ["DB_NAME"])
 
+    cur.execute(sql.SQL("GRANT CONNECT ON DATABASE {} TO {}").format(database, ident))
     cur.execute(sql.SQL("GRANT USAGE ON SCHEMA {} TO {}").format(sch, ident))
 
     if privileges == "read":
         _grant_read(cur, ident, sch)
-
     elif privileges == "readwrite":
         _grant_readwrite(cur, ident, sch)
-
     elif privileges == "migrate":
-        # Documented as "readwrite plus DDL", so it must actually include the
-        # sequence and default-privilege grants that readwrite makes - a
-        # migration that creates a table needs its sequences too.
         _grant_readwrite(cur, ident, sch)
         cur.execute(sql.SQL("GRANT CREATE ON SCHEMA {} TO {}").format(sch, ident))
 
     elif privileges == "app_admin":
-        # Master-equivalent access delivered via IAM, so that the real master
-        # user keeps password authentication and stays usable as break-glass.
-        #
-        # rds_superuser is the highest privilege Aurora PostgreSQL exposes;
-        # there is no true SUPERUSER on managed RDS. This is enough for the
-        # application team to create their own confined users later.
         cur.execute(sql.SQL("GRANT rds_superuser TO {}").format(ident))
         cur.execute(sql.SQL("GRANT CREATE ON SCHEMA {} TO {}").format(sch, ident))
         cur.execute(
-            sql.SQL("GRANT ALL PRIVILEGES ON DATABASE {} TO {}").format(
-                sql.Identifier(os.environ["DB_NAME"]), ident
-            )
+            sql.SQL("GRANT ALL PRIVILEGES ON DATABASE {} TO {}").format(database, ident)
         )
+
+
+def _verify_admin_state(cur, username: str, privileges: str) -> None:
+    if privileges == "app_admin":
+        return
+
+    if _has_effective_role_membership(cur, username, "rds_superuser"):
+        raise RuntimeError(
+            f"role '{username}' still has effective rds_superuser membership "
+            f"after being reconciled to '{privileges}'. REVOKE only removes "
+            "grants made by this bootstrap, so the membership is inherited "
+            "through another role or was granted outside Terraform. Refusing "
+            "to report a successful privilege downgrade - resolve the other "
+            "grant, then re-apply."
+        )
+
+
+def _reconcile_user(cur, user: dict, previous_user) -> None:
+    username = user["username"]
+    privileges = user.get("privileges", "readwrite")
+    schema = user.get("schema", "public")
+
+    _require_schema(cur, schema)
+    _ensure_role(cur, username)
+    _revoke_global_managed_privileges(cur, username)
+
+    schemas_to_reset = {schema}
+    if previous_user is not None:
+        schemas_to_reset.add(previous_user.get("schema", "public"))
+
+    for managed_schema in schemas_to_reset:
+        if _schema_exists(cur, managed_schema):
+            _revoke_schema_managed_privileges(cur, username, managed_schema)
+        else:
+            log.info(
+                "previous managed schema %s no longer exists; "
+                "skipping privilege cleanup for role %s",
+                managed_schema,
+                username,
+            )
+
+    _apply_privileges(cur, username, privileges, schema)
+
+    _verify_admin_state(cur, username, privileges)
 
 
 def _drop_role(cur, username: str) -> None:
     cur.execute("SELECT 1 FROM pg_roles WHERE rolname = %s", (username,))
     if cur.fetchone() is None:
+        log.info("role %s does not exist; nothing to drop", username)
         return
 
     log.info("dropping role %s", username)
-    # REASSIGN/DROP OWNED only reach objects in the CURRENT database. A role
-    # that owns objects in another database on this cluster will still block
-    # DROP ROLE - deliberately, since silently discarding them would be worse.
     cur.execute(
         sql.SQL("REASSIGN OWNED BY {} TO CURRENT_USER").format(sql.Identifier(username))
     )
@@ -175,30 +232,55 @@ def _drop_role(cur, username: str) -> None:
     cur.execute(sql.SQL("DROP ROLE {}").format(sql.Identifier(username)))
 
 
+def _username_of(user) -> str:
+    """Extract a username, failing with a readable message rather than KeyError."""
+    if not isinstance(user, dict) or not user.get("username"):
+        raise ValueError(
+            "each database user must be an object with a non-empty 'username'; "
+            f"got {user!r}"
+        )
+    return user["username"]
+
+
 def _validate(users) -> None:
     for user in users:
+        username = _username_of(user)
+
         privileges = user.get("privileges", "readwrite")
         if privileges not in VALID_PRIVILEGES:
             raise ValueError(
-                f"invalid privileges '{privileges}' for {user['username']}; "
+                f"invalid privileges '{privileges}' for {username}; "
                 f"expected one of {sorted(VALID_PRIVILEGES)}"
+            )
+
+        schema = user.get("schema", "public")
+        if not schema or not isinstance(schema, str):
+            raise ValueError(
+                f"invalid schema for {username}; 'schema' must be a non-empty string"
             )
 
 
 def lambda_handler(event, _context):
-    tf = event.get("tf", {})
-    action = tf.get("action", "create")
+    tf = event.get("tf") or {}
+    action = tf.get("action") or "create"
 
-    desired = event.get("users", [])
-    previous = tf.get("prev_input", {}).get("users", [])
+    if action not in VALID_ACTIONS:
+        raise ValueError(
+            f"invalid Terraform lifecycle action '{action}'; "
+            f"expected one of {sorted(VALID_ACTIONS)}"
+        )
 
-    _validate(desired)
+    desired = event.get("users") or []
+    previous = (tf.get("prev_input") or {}).get("users") or []
+
+    if action != "delete":
+        _validate(desired)
 
     log.info(
         "action=%s desired=%s previous=%s",
         action,
-        [u["username"] for u in desired],
-        [u["username"] for u in previous],
+        [u.get("username") for u in desired if isinstance(u, dict)],
+        [u.get("username") for u in previous if isinstance(u, dict)],
     )
 
     created, dropped = [], []
@@ -207,26 +289,21 @@ def lambda_handler(event, _context):
         conn.autocommit = False
         with conn.cursor() as cur:
             if action == "delete":
-                for user in desired:
-                    _drop_role(cur, user["username"])
-                    dropped.append(user["username"])
-            else:
-                for user in desired:
-                    username = user["username"]
-                    schema = user.get("schema", "public")
-                    _require_schema(cur, schema)
-                    _ensure_role(cur, username)
-                    _apply_privileges(
-                        cur, username, user.get("privileges", "readwrite"), schema
-                    )
-                    created.append(username)
+                for user in desired or previous:
+                    username = _username_of(user)
+                    _drop_role(cur, username)
+                    dropped.append(username)
 
-                # Users removed from db_users between applies. Without this
-                # they would linger with rds_iam intact - still reachable by
-                # any role holding rds-db:connect for that username.
-                for username in {u["username"] for u in previous} - {
-                    u["username"] for u in desired
-                }:
+            else:
+                previous_by_username = {
+                    _username_of(u): u for u in previous if isinstance(u, dict)
+                }
+                desired_usernames = {_username_of(u) for u in desired}
+                for user in desired:
+                    username = _username_of(user)
+                    _reconcile_user(cur, user, previous_by_username.get(username))
+                    created.append(username)
+                for username in set(previous_by_username) - desired_usernames:
                     _drop_role(cur, username)
                     dropped.append(username)
 
