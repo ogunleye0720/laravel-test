@@ -1,0 +1,167 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: helios-dummy-otlp
+  namespace: helios-test
+  labels:
+    app.kubernetes.io/part-of: helios-validation
+data:
+  send.py: |
+    import json
+    import os
+    import random
+    import sys
+    import time
+    import urllib.error
+    import urllib.request
+
+    endpoint = os.environ["OTEL_EXPORTER_OTLP_ENDPOINT"].rstrip("/")
+    interval = int(os.environ.get("SEND_INTERVAL_SECONDS", "15"))
+
+    def post(signal, payload):
+        url = f"{endpoint}/v1/{signal}"
+        body = json.dumps(payload).encode("utf-8")
+        request = urllib.request.Request(
+            url,
+            data=body,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+
+        try:
+            with urllib.request.urlopen(request, timeout=10) as response:
+                print(
+                    f"sent OTLP {signal} to {url}: status={response.status}",
+                    flush=True,
+                )
+        except Exception as exc:
+            print(
+                f"failed OTLP {signal} to {url}: {exc}",
+                file=sys.stderr,
+                flush=True,
+            )
+
+    def resource(service_name):
+        return {
+            "attributes": [
+                {
+                    "key": "service.name",
+                    "value": {"stringValue": service_name},
+                },
+                {
+                    "key": "deployment.environment",
+                    "value": {"stringValue": "helios-test"},
+                },
+            ]
+        }
+
+    counter = 0
+
+    while True:
+        counter += 1
+        now = time.time_ns()
+        now_string = str(now)
+
+        logs = {
+            "resourceLogs": [
+                {
+                    "resource": resource("helios-dummy-otlp"),
+                    "scopeLogs": [
+                        {
+                            "scope": {"name": "helios.validation"},
+                            "logRecords": [
+                                {
+                                    "timeUnixNano": now_string,
+                                    "observedTimeUnixNano": now_string,
+                                    "severityNumber": 9,
+                                    "severityText": "INFO",
+                                    "body": {
+                                        "stringValue": f"helios synthetic OTLP log {counter}"
+                                    },
+                                    "attributes": [
+                                        {
+                                            "key": "helios.test.sequence",
+                                            "value": {"intValue": str(counter)},
+                                        }
+                                    ],
+                                }
+                            ],
+                        }
+                    ],
+                }
+            ]
+        }
+
+        metrics = {
+            "resourceMetrics": [
+                {
+                    "resource": resource("helios-dummy-otlp"),
+                    "scopeMetrics": [
+                        {
+                            "scope": {"name": "helios.validation"},
+                            "metrics": [
+                                {
+                                    "name": "helios.dummy.sequence",
+                                    "description": "Synthetic metric for Helios validation",
+                                    "unit": "1",
+                                    "gauge": {
+                                        "dataPoints": [
+                                            {
+                                                "timeUnixNano": now_string,
+                                                "asDouble": float(counter),
+                                            }
+                                        ]
+                                    },
+                                }
+                            ],
+                        }
+                    ],
+                }
+            ]
+        }
+
+        trace_id = f"{random.getrandbits(128):032x}"
+        span_id = f"{random.getrandbits(64):016x}"
+        end = str(now + 5_000_000)
+        traces = {
+            "resourceSpans": [
+                {
+                    "resource": resource("helios-dummy-otlp"),
+                    "scopeSpans": [
+                        {
+                            "scope": {"name": "helios.validation"},
+                            "spans": [
+                                {
+                                    "traceId": trace_id,
+                                    "spanId": span_id,
+                                    "name": "helios-dummy-span",
+                                    "kind": 2,
+                                    "startTimeUnixNano": now_string,
+                                    "endTimeUnixNano": end,
+                                    "attributes": [
+                                        {
+                                            "key": "helios.test.sequence",
+                                            "value": {"intValue": str(counter)},
+                                        }
+                                    ],
+                                    "status": {"code": 1},
+                                }
+                            ],
+                        }
+                    ],
+                }
+            ]
+        }
+
+        # The daemon collector exposes OTLP/HTTP on the module's configured port.
+        # A normal OTel SDK also uses OTEL_EXPORTER_OTLP_ENDPOINT as its base URL
+        # and appends /v1/logs, /v1/metrics and /v1/traces for OTLP/HTTP.
+        post("logs", logs)
+        post("metrics", metrics)
+        post("traces", traces)
+
+        print(
+            f"helios dummy application heartbeat sequence={counter}",
+            flush=True,
+        )
+        time.sleep(interval)

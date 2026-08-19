@@ -1,0 +1,41 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: helios-dummy-stdout
+  namespace: helios-test
+  labels:
+    app: helios-dummy-stdout
+    app.kubernetes.io/part-of: helios-validation
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: helios-dummy-stdout
+  template:
+    metadata:
+      labels:
+        app: helios-dummy-stdout
+        app.kubernetes.io/part-of: helios-validation
+    spec:
+      containers:
+        - name: logger
+          image: busybox:1.36.1
+          imagePullPolicy: IfNotPresent
+          command:
+            - /bin/sh
+            - -ec
+            - |
+              i=0
+              while true; do
+                i=$((i + 1))
+                echo "helios dummy stdout message=${i} pod=${HOSTNAME}"
+                echo "helios dummy stderr message=${i} pod=${HOSTNAME}" >&2
+                sleep 15
+              done
+          resources:
+            requests:
+              cpu: 5m
+              memory: 8Mi
+            limits:
+              cpu: 50m
+              memory: 32Mi

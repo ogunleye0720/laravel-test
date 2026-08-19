@@ -1,82 +1,94 @@
-# ![Laravel RealWorld Example App](.github/readme/logo.png)
+# Helios dummy workloads
 
-[![RealWorld: Backend](https://img.shields.io/badge/RealWorld-Backend-blueviolet.svg)](https://github.com/gothinkster/realworld)
-[![Tests: status](https://github.com/f1amy/laravel-realworld-example-app/actions/workflows/tests.yml/badge.svg)](https://github.com/f1amy/laravel-realworld-example-app/actions/workflows/tests.yml)
-[![Coverage: percent](https://codecov.io/gh/f1amy/laravel-realworld-example-app/branch/main/graph/badge.svg)](https://codecov.io/gh/f1amy/laravel-realworld-example-app)
-[![Static Analysis: status](https://github.com/f1amy/laravel-realworld-example-app/actions/workflows/static-analysis.yml/badge.svg)](https://github.com/f1amy/laravel-realworld-example-app/actions/workflows/static-analysis.yml)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellowgreen.svg)](https://opensource.org/licenses/MIT)
+These workloads are intentionally **example/test resources only**. They are not part
+of the reusable Helios module and must not be deployed automatically to consumer
+clusters.
 
-> Example of a PHP-based Laravel application containing real world examples (CRUD, auth, advanced patterns, etc) that adheres to the [RealWorld](https://github.com/gothinkster/realworld) API spec.
+They validate two different ingestion paths:
 
-This codebase was created to demonstrate a backend application built with [Laravel framework](https://laravel.com/) including RESTful services, CRUD operations, authentication, routing, pagination, and more.
+1. `helios-dummy-stdout` writes to stdout/stderr every 15 seconds. No OTLP endpoint
+   is required. The Helios daemon collector's `filelog` receiver should discover
+   these records from `/var/log/pods` automatically.
+2. `helios-dummy-otlp` emits synthetic OTLP/HTTP logs, metrics and traces every 15
+   seconds. It sets `OTEL_EXPORTER_OTLP_ENDPOINT` to the in-cluster daemon collector
+   Service, matching the endpoint used by the module's Instrumentation CR.
 
-We've gone to great lengths to adhere to the **Laravel framework** community style guides & best practices.
+## Why the OTLP pod points to the daemon collector
 
-For more information on how to this works with other frontends/backends, head over to the [RealWorld](https://github.com/gothinkster/realworld) repo.
+The dummy OTLP pod represents an instrumented application. Application telemetry
+should enter the Helios stack through the daemon collector, not bypass it and send
+straight to Elasticsearch.
 
-## How it works
+The module exposes the daemon receiver at:
 
-The API is built with [Laravel](https://laravel.com/), making the most of the framework's features out-of-the-box.
+```text
+http://opentelemetry-kube-stack-daemon-collector.opentelemetry-operator-system.svc.cluster.local:4418
+```
 
-The application is using a custom JWT auth implementation: [`app/Jwt`](./app/Jwt).
+The pieces of that address are intentional:
 
-## Getting started
+- `opentelemetry-kube-stack-daemon-collector` is the daemon collector Service.
+- `opentelemetry-operator-system` is the Helios namespace fixed by this module.
+- `svc.cluster.local` is Kubernetes service discovery inside the cluster.
+- `4418` is the module's OTLP/HTTP port. It was moved from the standard `4318`
+  because Datadog already owns hostPort `4318` on the target clusters.
 
-The preferred way of setting up the project is using [Laravel Sail](https://laravel.com/docs/sail),
-for that you'll need [Docker](https://docs.docker.com/get-docker/) under Linux / macOS (or Windows WSL2).
+The gateway is the egress tier: daemon/cluster collectors forward telemetry to it,
+and the gateway exports to Elastic. Pointing a test application directly at Elastic
+would bypass the exact in-cluster path this example is intended to prove.
 
-### Installation
+The stdout pod is different: it does **not** need this endpoint because its output is
+collected from the Kubernetes node's pod-log files by `filelog`.
 
-Clone the repository and change directory:
+## Apply on the dev-8 validation cluster
 
-    git clone https://github.com/f1amy/laravel-realworld-example-app.git
-    cd laravel-realworld-example-app
+After Terraform has created the EKS cluster and Helios is healthy:
 
-Install dependencies (if you have `composer` locally):
+```bash
+kubectl apply -k examples/helios-dummy-pods
+kubectl -n helios-test get pods -o wide
+```
 
-    composer create-project
+Watch the synthetic OTLP sender:
 
-Alternatively you can do the same with Docker:
+```bash
+kubectl -n helios-test logs -f deploy/helios-dummy-otlp
+```
 
-    docker run --rm -it \
-        --volume $PWD:/app \
-        --user $(id -u):$(id -g) \
-        composer create-project
+Expected messages include HTTP `200` responses for `logs`, `metrics` and `traces`.
+The response may be `200` with an empty body; that is normal for OTLP/HTTP success.
 
-Start the containers with PHP application and PostgreSQL database:
+Watch the plain stdout workload:
 
-    ./vendor/bin/sail up -d
+```bash
+kubectl -n helios-test logs -f deploy/helios-dummy-stdout
+```
 
-(Optional) Configure a Bash alias for `sail` command:
+Also verify the Helios components remain healthy:
 
-    alias sail='[ -f sail ] && bash sail || bash vendor/bin/sail'
+```bash
+kubectl -n opentelemetry-operator-system get pods -o wide
+kubectl -n opentelemetry-operator-system get svc
+```
 
-Migrate the database with seeding:
+Then search Elastic/Kibana for:
 
-    sail artisan migrate --seed
+```text
+service.name: "helios-dummy-otlp"
+```
 
-## Usage
+and/or Kubernetes metadata for the `helios-test` namespace. For the stdout workload,
+search for:
 
-The API is available at `http://localhost:3000/api` (You can change the `APP_PORT` in `.env` file).
+```text
+helios dummy stdout
+```
 
-### Run tests
+## Clean up
 
-    sail artisan test
+```bash
+kubectl delete -k examples/helios-dummy-pods
+```
 
-### Run PHPStan static analysis
-
-    sail php ./vendor/bin/phpstan
-
-### OpenAPI specification (not ready yet)
-
-Swagger UI will be live at [http://localhost:3000/api/documentation](http://localhost:3000/api/documentation).
-
-For now, please visit the specification [here](https://github.com/gothinkster/realworld/tree/main/api).
-
-## Contributions
-
-Feedback, suggestions, and improvements are welcome, feel free to contribute.
-
-## License
-
-The MIT License (MIT). Please see [`LICENSE`](./LICENSE) for more information.
+This deletes only the dummy validation namespace/workloads. It does not touch the
+Helios installation itself.

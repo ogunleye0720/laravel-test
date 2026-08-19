@@ -1,0 +1,46 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: helios-dummy-otlp
+  namespace: helios-test
+  labels:
+    app: helios-dummy-otlp
+    app.kubernetes.io/part-of: helios-validation
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: helios-dummy-otlp
+  template:
+    metadata:
+      labels:
+        app: helios-dummy-otlp
+        app.kubernetes.io/part-of: helios-validation
+    spec:
+      containers:
+        - name: sender
+          image: python:3.13-alpine
+          imagePullPolicy: IfNotPresent
+          command:
+            - python
+            - /opt/helios/send.py
+          env:
+            - name: OTEL_EXPORTER_OTLP_ENDPOINT
+              value: http://opentelemetry-kube-stack-daemon-collector.opentelemetry-operator-system.svc.cluster.local:4418
+            - name: SEND_INTERVAL_SECONDS
+              value: "15"
+          volumeMounts:
+            - name: sender-script
+              mountPath: /opt/helios
+              readOnly: true
+          resources:
+            requests:
+              cpu: 10m
+              memory: 24Mi
+            limits:
+              cpu: 100m
+              memory: 64Mi
+      volumes:
+        - name: sender-script
+          configMap:
+            name: helios-dummy-otlp
