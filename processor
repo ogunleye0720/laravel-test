@@ -1,0 +1,48 @@
+gateway_processing_overlay = [
+  yamlencode({
+    collectors = {
+      gateway = {
+        config = {
+          processors = merge(
+            {
+              "resource/data_stream_namespace" = {
+                attributes = [{
+                  key    = "data_stream.namespace"
+                  action = "upsert"
+                  value  = var.data_stream_namespace
+                }]
+              }
+            },
+
+            length(local.helios_namespace_exclusion_conditions) == 0 ? {} : {
+              "filter/excluded_namespaces" = {
+                error_mode = "ignore"
+
+                traces = {
+                  span = local.helios_namespace_exclusion_conditions
+                }
+
+                metrics = {
+                  datapoint = local.helios_namespace_exclusion_conditions
+                }
+
+                logs = {
+                  log_record = local.helios_namespace_exclusion_conditions
+                }
+              }
+            }
+          )
+
+          service = {
+            pipelines = {
+              for name, processors in local.gateway_pipeline_processors :
+              name => {
+                processors = processors
+              }
+            }
+          }
+        }
+      }
+    }
+  })
+]
