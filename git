@@ -1,0 +1,5 @@
+git config --show-origin --get-regexp '^url\..*\.insteadof$' \
+  | sed -E 's#https://[^@]+@github.com/#https://***@github.com/#'
+
+git ls-remote \
+  ssh://git@github.com/terraform-aws-secrets-github.git
